@@ -24,6 +24,10 @@ HEADER_ZONE_HEIGHT = 60
 # Pattern for detecting timestamp columns (MM:SS format)
 TIMESTAMP_PATTERN = re.compile(r'^\d{1,2}:\d{2}$')
 
+# Pattern for detecting speaker labels (e.g. "EJ:", "BN:", "INTERVIEWER:").
+# A single token ending in a colon, short enough to be an initials/name tag.
+SPEAKER_LABEL_PATTERN = re.compile(r"^[A-Za-z0-9][\w.'\-]{0,19}:$")
+
 
 def is_header_content(words):
     """
@@ -133,6 +137,56 @@ def detect_columns(words, page_width):
         columns.append((column_breaks[i], column_breaks[i + 1]))
 
     return columns
+
+
+def collapse_speaker_label_columns(words, columns, page_width):
+    """
+    Undo a false column split caused by a speaker-label hanging indent.
+
+    Oral-history transcripts put the speaker label (e.g. "EJ:", "BN:") in the
+    left margin and indent the spoken text. The wide gap between the label and
+    the indented text looks like a column boundary to ``detect_columns``, which
+    causes the whole stack of labels to be emitted before any of the text.
+
+    When the leftmost detected column contains only speaker labels and each of
+    those labels shares a line (same ``top``) with content in a column to its
+    right, the split is spurious: it is one logical column with a hanging
+    indent. In that case collapse everything into a single column so the
+    row-by-row line reconstruction re-attaches each label to its own line.
+    """
+    if len(columns) < 2:
+        return columns
+
+    left_start, left_end = columns[0]
+    left_words = [
+        w for w in words if left_start <= (w["x0"] + w["x1"]) / 2 < left_end
+    ]
+    right_words = [
+        w for w in words if (w["x0"] + w["x1"]) / 2 >= left_end
+    ]
+
+    if not left_words or not right_words:
+        return columns
+
+    # Look only at left-column words that share a row (same ``top``) with text
+    # in a right-hand column. Standalone left words such as a running page
+    # header ("Barbara Nicodemus") don't align with any text row; they collapse
+    # back into place correctly regardless, so we ignore them here.
+    right_tops = [w["top"] for w in right_words]
+    aligned_left = [
+        w for w in left_words
+        if any(abs(w["top"] - rt) <= 3 for rt in right_tops)
+    ]
+
+    # Need a few aligned tokens, and every one of them must be a speaker label.
+    # In a genuine two-column layout the aligned left words are ordinary prose,
+    # so this guard leaves real columns untouched.
+    if len(aligned_left) < 2:
+        return columns
+    if not all(SPEAKER_LABEL_PATTERN.match(w["text"]) for w in aligned_left):
+        return columns
+
+    return [(0, page_width)]
 
 
 def filter_timestamp_words(words):
@@ -283,6 +337,7 @@ def process_page(page, strip_timestamps=False):
 
     if words:
         columns = detect_columns(words, page_width)
+        columns = collapse_speaker_label_columns(words, columns, page_width)
         text = words_to_text(words, columns, strip_timestamps, page_width)
         if text.strip():
             parts.append(text)
