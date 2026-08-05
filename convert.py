@@ -18,8 +18,11 @@ from pathlib import Path
 import pdfplumber
 
 
-# Vertical threshold (in points) for header zone at top of page
+# Vertical threshold (in points) for header/footer zones at top/bottom of page.
+# Running headers and footers (page numbers, institution names, "Page X of Y")
+# live in these margins; body text does not normally reach them.
 HEADER_ZONE_HEIGHT = 60
+FOOTER_ZONE_HEIGHT = 60
 
 # Pattern for detecting timestamp columns (MM:SS format)
 TIMESTAMP_PATTERN = re.compile(r'^\d{1,2}:\d{2}$')
@@ -28,36 +31,54 @@ TIMESTAMP_PATTERN = re.compile(r'^\d{1,2}:\d{2}$')
 # A single token ending in a colon, short enough to be an initials/name tag.
 SPEAKER_LABEL_PATTERN = re.compile(r"^[A-Za-z0-9][\w.'\-]{0,19}:$")
 
+# Pattern for a full speaker-label line: one to four capitalized name/initial
+# tokens ending in a colon, e.g. "GA:", "Eugene Hunt:", "J. Michael Graves:".
+SPEAKER_LINE_PATTERN = re.compile(
+    r"^[A-Z][A-Za-z.'\-]*(?:\s+[A-Za-z][A-Za-z.'\-]*){0,3}:$"
+)
 
-def is_header_content(words):
+# The repeated column-header row of the transcript table.
+TABLE_HEADER_PATTERN = re.compile(r"^timestamp\s+speaker\s+content$", re.IGNORECASE)
+
+
+def is_boilerplate_content(words):
     """
-    Determine if a group of words represents header content.
+    Determine if a group of words is a running header/footer or other
+    boilerplate that should be dropped rather than kept as transcript text.
 
-    Headers typically include:
+    Boilerplate typically includes:
+    - A page number (standalone, "Page X", or "Page X of Y")
     - A name (often uppercase) with a page number
     - An institution name
-    - Short lines at the very top of the page
+    - The repeated "Oral History Interview with ...: Transcript" running line
     """
     if not words:
         return False
 
     text = " ".join(w["text"] for w in words).strip()
 
-    # Check for page number pattern (standalone number or "Page X")
+    # Page-number patterns (standalone number, "Page X", "Page X of Y")
     if re.match(r"^\d+$", text):
         return True
     if re.match(r"^page\s+\d+$", text, re.IGNORECASE):
         return True
+    if re.search(r"page\s+\d+\s+of\s+\d+", text, re.IGNORECASE):
+        return True
 
-    # Check for name + page number pattern (e.g., "ALSTON 2", "SMITH 15")
+    # Name + page number pattern (e.g., "ALSTON 2", "SMITH 15")
     if re.match(r"^[A-Z]+\s+\d+$", text):
         return True
 
-    # Check for short uppercase text (likely a name like "ALSTON")
+    # Short uppercase text (likely a name like "ALSTON")
     if len(text) <= 30 and text.isupper() and text.replace(" ", "").isalpha():
         return True
 
-    # Check for institutional patterns
+    # Running interview footer, e.g.
+    # "Oral History Interview with Ruby Cornwell: Transcript Page 2 of 27"
+    if re.search(r"oral history interview with .+transcript", text, re.IGNORECASE):
+        return True
+
+    # Institutional patterns (e.g. "Avery Normal Institute Oral History Project")
     institutional_keywords = [
         "research center", "university", "college", "institute",
         "library", "archives", "museum", "foundation"
@@ -69,42 +90,134 @@ def is_header_content(words):
     return False
 
 
-def filter_header_words(words):
-    """
-    Remove words that appear to be page header content.
+def _group_zone_lines(zone_words):
+    """Group a set of words into lines by y-coordinate (within 5pt)."""
+    zone_sorted = sorted(zone_words, key=lambda w: w["top"])
+    lines = []
+    current_line = [zone_sorted[0]]
+    for word in zone_sorted[1:]:
+        if abs(word["top"] - current_line[-1]["top"]) <= 5:
+            current_line.append(word)
+        else:
+            lines.append(current_line)
+            current_line = [word]
+    lines.append(current_line)
+    return lines
 
-    Filters words in the top header zone that match header patterns.
+
+def _filter_margin_boilerplate(words, in_zone):
+    """
+    Drop words in a top/bottom margin zone whose line reads as boilerplate.
+
+    ``in_zone(word)`` selects the candidate margin words. Only lines that match
+    :func:`is_boilerplate_content` are removed; anything else in the zone (real
+    body text that happens to reach the margin) is preserved.
     """
     if not words:
         return words
 
-    # Separate words into header zone and body
-    header_zone_words = [w for w in words if w["top"] < HEADER_ZONE_HEIGHT]
-    body_words = [w for w in words if w["top"] >= HEADER_ZONE_HEIGHT]
-
-    if not header_zone_words:
+    zone_words = [w for w in words if in_zone(w)]
+    body_words = [w for w in words if not in_zone(w)]
+    if not zone_words:
         return words
 
-    # Group header zone words into lines by y-coordinate
-    header_zone_words_sorted = sorted(header_zone_words, key=lambda w: w["top"])
-    header_lines = []
-    current_line = [header_zone_words_sorted[0]]
-
-    for word in header_zone_words_sorted[1:]:
-        if abs(word["top"] - current_line[-1]["top"]) <= 5:
-            current_line.append(word)
-        else:
-            header_lines.append(current_line)
-            current_line = [word]
-    header_lines.append(current_line)
-
-    # Check each line - if it looks like header content, exclude it
     words_to_keep = list(body_words)
-    for line_words in header_lines:
-        if not is_header_content(line_words):
+    for line_words in _group_zone_lines(zone_words):
+        if not is_boilerplate_content(line_words):
             words_to_keep.extend(line_words)
 
     return words_to_keep
+
+
+def filter_header_words(words):
+    """Remove running-header boilerplate in the top margin zone."""
+    return _filter_margin_boilerplate(words, lambda w: w["top"] < HEADER_ZONE_HEIGHT)
+
+
+def filter_footer_words(words, page_height):
+    """Remove running-footer boilerplate in the bottom margin zone."""
+    threshold = page_height - FOOTER_ZONE_HEIGHT
+    return _filter_margin_boilerplate(words, lambda w: w["top"] > threshold)
+
+
+def group_into_rows(words, tol=3):
+    """
+    Group words into visual rows by ``top`` (within ``tol`` points).
+
+    Rows are returned top-to-bottom; words within each row are sorted
+    left-to-right by ``x0``.
+    """
+    if not words:
+        return []
+    ws = sorted(words, key=lambda w: (round(w["top"]), w["x0"]))
+    rows = []
+    current = [ws[0]]
+    for w in ws[1:]:
+        if abs(w["top"] - current[-1]["top"]) <= tol:
+            current.append(w)
+        else:
+            rows.append(sorted(current, key=lambda x: x["x0"]))
+            current = [w]
+    rows.append(sorted(current, key=lambda x: x["x0"]))
+    return rows
+
+
+def looks_like_transcript_layout(words, page_width):
+    """
+    Detect the ``Timestamp | Speaker | Content`` transcript-table layout.
+
+    These pages must be reconstructed row-by-row, never split into vertical
+    columns: the speaker column and content column are separated by a wide gap
+    that ``detect_columns`` would otherwise treat as a column boundary, emitting
+    every speaker label first and all the spoken text afterwards.
+
+    A row counts as a labelled transcript row when, after an optional leading
+    timestamp, it begins with a left-margin speaker label (``Name:``) followed
+    by spoken text on the same row. Several such rows mark the layout.
+    """
+    labelled = 0
+    for row in group_into_rows(words):
+        i = 0
+        if i < len(row) and TIMESTAMP_PATTERN.match(row[i]["text"]):
+            i += 1
+        if i >= len(row):
+            continue
+
+        # The label must sit in the left margin, not out in the content column.
+        if row[i]["x0"] > page_width * 0.45:
+            continue
+
+        # Find the colon that closes the label within the first few tokens.
+        label_end = None
+        for j in range(i, min(i + 4, len(row))):
+            if row[j]["text"].endswith(":"):
+                label_end = j
+                break
+        if label_end is None or label_end + 1 >= len(row):
+            # No label, or the label stands alone with no spoken text beside it.
+            continue
+
+        label_text = " ".join(row[k]["text"] for k in range(i, label_end + 1))
+        if not SPEAKER_LINE_PATTERN.match(label_text):
+            continue
+
+        labelled += 1
+
+    return labelled >= 3
+
+
+def drop_table_header_row(words):
+    """Remove the repeated ``Timestamp Speaker Content`` column-header row."""
+    if not words:
+        return words
+    drop = set()
+    for row in group_into_rows(words):
+        text = " ".join(w["text"] for w in row).strip()
+        if TABLE_HEADER_PATTERN.match(text):
+            drop.update(id(w) for w in row)
+    if not drop:
+        return words
+    return [w for w in words if id(w) not in drop]
 
 
 def detect_columns(words, page_width):
@@ -294,12 +407,34 @@ def table_to_text(table):
     return "\n".join(rows)
 
 
-def process_page(page, strip_timestamps=False):
+def is_transcript_document(pages, sample=10):
+    """
+    Decide whether a document uses the ``Timestamp | Speaker | Content``
+    transcript-table layout by sampling its early pages.
+
+    The layout must be judged for the document as a whole: an individual page
+    may hold a single long monologue with too few speaker turns to recognize on
+    its own, yet it still shares the same three-column structure and must be read
+    row-by-row. The table is declared on the opening pages, so a sample suffices.
+    """
+    for page in pages[:sample]:
+        words = filter_header_words(page.extract_words())
+        words = filter_footer_words(words, page.height)
+        if words and looks_like_transcript_layout(words, page.width):
+            return True
+    return False
+
+
+def process_page(page, strip_timestamps=False, force_rows=False):
     """
     Extract text from a single pdfplumber page.
 
     Tables are extracted first and rendered as text blocks. Remaining
     words are processed with column detection.
+
+    ``force_rows`` forces row-by-row reconstruction (single column) for pages of
+    a known transcript document, so a page with few speaker turns can't be
+    mis-split into stacked speaker and content columns.
     """
     parts = []
     page_width = page.width
@@ -332,12 +467,21 @@ def process_page(page, strip_timestamps=False):
     else:
         words = all_words
 
-    # Filter out page header content
+    # Filter out running header/footer boilerplate and the repeated
+    # "Timestamp Speaker Content" column header.
     words = filter_header_words(words)
+    words = filter_footer_words(words, page.height)
+    words = drop_table_header_row(words)
 
     if words:
-        columns = detect_columns(words, page_width)
-        columns = collapse_speaker_label_columns(words, columns, page_width)
+        # Transcript-table pages (Timestamp | Speaker | Content) must be read
+        # row-by-row. Only fall back to column detection for genuinely
+        # multi-column pages (e.g. back-matter subject-heading lists).
+        if force_rows or looks_like_transcript_layout(words, page_width):
+            columns = [(0, page_width)]
+        else:
+            columns = detect_columns(words, page_width)
+            columns = collapse_speaker_label_columns(words, columns, page_width)
         text = words_to_text(words, columns, strip_timestamps, page_width)
         if text.strip():
             parts.append(text)
@@ -355,8 +499,9 @@ def convert_pdf(pdf_path, output_path, strip_timestamps=False):
 
     page_texts = []
     with pdfplumber.open(pdf_path) as pdf:
+        force_rows = is_transcript_document(pdf.pages)
         for page in pdf.pages:
-            text = process_page(page, strip_timestamps)
+            text = process_page(page, strip_timestamps, force_rows=force_rows)
             if text.strip():
                 page_texts.append(text)
 
