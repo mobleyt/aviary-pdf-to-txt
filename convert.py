@@ -20,8 +20,12 @@ import pdfplumber
 
 # Vertical threshold (in points) for header/footer zones at top/bottom of page.
 # Running headers and footers (page numbers, institution names, "Page X of Y")
-# live in these margins; body text does not normally reach them.
-HEADER_ZONE_HEIGHT = 60
+# live in these margins; body text does not normally reach them. The zone spans
+# the top one-inch (72pt) margin, tall enough to include multi-line running
+# headers (e.g. a name line above an accession-ID line) that sit a little below
+# the very top of the page, while leaving a page-1 title block — which begins at
+# the one-inch content margin — intact.
+HEADER_ZONE_HEIGHT = 72
 FOOTER_ZONE_HEIGHT = 60
 
 # Pattern for detecting timestamp columns (MM:SS format)
@@ -39,6 +43,20 @@ SPEAKER_LINE_PATTERN = re.compile(
 
 # The repeated column-header row of the transcript table.
 TABLE_HEADER_PATTERN = re.compile(r"^timestamp\s+speaker\s+content$", re.IGNORECASE)
+
+# An accession / collection ID used as a running header, e.g. "LGBTQ-OH-029",
+# "AMN-123". Two or more uppercase letters followed by hyphen-joined groups of
+# letters and/or digits.
+ACCESSION_ID_PATTERN = re.compile(r"^[A-Z]{2,}(?:-[A-Za-z0-9]+)+$")
+
+# A short running-header name line: one to four title-cased tokens, e.g.
+# "DeLesslin George-Warren", "Ruby Cornwell". Each token starts with a capital
+# and may contain internal letters, hyphens, apostrophes, or periods (to allow
+# names like "George-Warren" or "J. Michael Graves"). Unlike the all-uppercase
+# rule below, this catches title-cased header names.
+NAME_HEADER_PATTERN = re.compile(
+    r"^[A-Z][A-Za-z.'\-]*(?:\s+[A-Z][A-Za-z.'\-]*){0,3}$"
+)
 
 
 def is_boilerplate_content(words):
@@ -71,6 +89,16 @@ def is_boilerplate_content(words):
 
     # Short uppercase text (likely a name like "ALSTON")
     if len(text) <= 30 and text.isupper() and text.replace(" ", "").isalpha():
+        return True
+
+    # Accession / collection ID (e.g. "LGBTQ-OH-029")
+    if len(text) <= 30 and ACCESSION_ID_PATTERN.match(text):
+        return True
+
+    # Short title-cased running-header name (e.g. "DeLesslin George-Warren").
+    # Restricted to the margin zones by the callers, so a body line that merely
+    # looks like a name is not at risk here.
+    if len(text) <= 40 and NAME_HEADER_PATTERN.match(text):
         return True
 
     # Running interview footer, e.g.
