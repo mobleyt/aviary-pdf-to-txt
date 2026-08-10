@@ -44,6 +44,16 @@ SPEAKER_LINE_PATTERN = re.compile(
 # The repeated column-header row of the transcript table.
 TABLE_HEADER_PATTERN = re.compile(r"^timestamp\s+speaker\s+content$", re.IGNORECASE)
 
+# Start of a speaker turn: an optional leading timestamp, then a speaker label
+# (one to four capitalized name/initial tokens) ending in a colon, e.g.
+# "00:14 Eugene Hunt:", "GA:", "Interviewee:". Used by --reflow to decide where a
+# paragraph must break. Matched against a reconstructed line (label + content),
+# so the colon may be followed by the spoken text rather than the end of string.
+TURN_START_PATTERN = re.compile(
+    r"^(?:\d{1,2}:\d{2}\s+)?"
+    r"[A-Z][A-Za-z.'\-]*(?:\s+[A-Za-z][A-Za-z.'\-]*){0,3}:(?:\s|$)"
+)
+
 # An accession / collection ID used as a running header, e.g. "LGBTQ-OH-029",
 # "AMN-123". Two or more uppercase letters followed by hyphen-joined groups of
 # letters and/or digits.
@@ -517,23 +527,141 @@ def process_page(page, strip_timestamps=False, force_rows=False):
     return "\n\n".join(parts)
 
 
-def convert_pdf(pdf_path, output_path, strip_timestamps=False):
+def page_row_records(page, strip_timestamps=False):
+    """
+    Reconstruct a transcript page as a list of visual-row records for reflow.
+
+    Each record is ``{"page", "top", "right", "text"}`` where ``right`` is the
+    row's right edge (used to tell a wrapped line, which reaches the text-block
+    margin, from a paragraph- or list-final line, which ends short).
+    """
+    words = page.extract_words()
+    words = filter_header_words(words)
+    words = filter_footer_words(words, page.height)
+    words = drop_table_header_row(words)
+    if strip_timestamps:
+        words = filter_timestamp_words(words)
+
+    records = []
+    for row in group_into_rows(words):
+        records.append({
+            "page": page.page_number,
+            "top": min(w["top"] for w in row),
+            "right": max(w["x1"] for w in row),
+            "text": " ".join(w["text"] for w in row),
+        })
+    return records
+
+
+def reflow_records(records, page_width):
+    """
+    Merge soft-wrapped visual rows into flowing paragraphs.
+
+    A new speaker turn (:data:`TURN_START_PATTERN`) always starts a fresh
+    paragraph. Beyond that the rule depends on what kind of block is in progress:
+
+    - Inside a speaker turn, rows keep joining until the next turn or a
+      section-sized vertical gap. A turn runs to the next label regardless of how
+      short its final line is, so a long word wrapping early never splits it.
+    - Outside a turn (front matter, abstract, back-matter lists), a row that
+      ended short of the text-block right margin closes the block: a wrapped body
+      line runs to the margin, so a short line marks a paragraph or list-item
+      end. This keeps the abstract flowing while leaving ragged lists such as the
+      subject headings one item per line.
+
+    A turn split across a page boundary is rejoined, because the first row of the
+    new page is neither a new turn nor separated by a same-page gap.
+
+    Returns a list of paragraph strings.
+    """
+    if not records:
+        return []
+
+    # Text-block right margin: the widest row reaches it. A row is "full" (a
+    # wrapped line) when its right edge is within a tolerance of that margin.
+    margin = max(r["right"] for r in records)
+    tol = page_width * 0.12
+
+    # Typical single-line leading: the median of small same-page row gaps.
+    gaps = sorted(
+        b["top"] - a["top"]
+        for a, b in zip(records, records[1:])
+        if b["page"] == a["page"] and 0 < b["top"] - a["top"] < page_width
+    )
+    body_leading = gaps[len(gaps) // 2] if gaps else 0
+
+    def same_page_section_break(rec, prev):
+        if rec["page"] != prev["page"] or body_leading <= 0:
+            return False
+        return rec["top"] - prev["top"] > body_leading * 1.7
+
+    paragraphs = []
+    current = None
+    current_is_turn = False
+    prev = None
+    for rec in records:
+        text = rec["text"]
+        is_turn = bool(TURN_START_PATTERN.match(text))
+
+        if current is None or is_turn:
+            start_new = True
+        elif current_is_turn:
+            # Inside a speaker turn: only a section-sized gap ends it early.
+            start_new = same_page_section_break(rec, prev)
+        else:
+            # Front matter / abstract / lists: a short prior line ends the block.
+            start_new = (prev["right"] < margin - tol
+                         or same_page_section_break(rec, prev))
+
+        if start_new:
+            if current is not None:
+                paragraphs.append(current)
+            current = text
+            current_is_turn = is_turn
+        elif current.endswith("-"):
+            # Word hyphenated across a line break: keep the hyphen, no space.
+            current += text
+        else:
+            current += " " + text
+        prev = rec
+
+    if current is not None:
+        paragraphs.append(current)
+    return paragraphs
+
+
+def convert_pdf(pdf_path, output_path, strip_timestamps=False, reflow=True):
     """
     Convert a single PDF file to a text file.
     Text flows continuously without page break markers.
+
+    With ``reflow`` (the default), transcript documents have their soft-wrapped
+    lines merged into flowing paragraphs (one per speaker turn). Pass
+    ``reflow=False`` to preserve every PDF line break instead.
     """
     pdf_path = Path(pdf_path)
     output_path = Path(output_path)
 
-    page_texts = []
     with pdfplumber.open(pdf_path) as pdf:
         force_rows = is_transcript_document(pdf.pages)
-        for page in pdf.pages:
-            text = process_page(page, strip_timestamps, force_rows=force_rows)
-            if text.strip():
-                page_texts.append(text)
 
-    full_text = "\n\n".join(page_texts)
+        if reflow and force_rows:
+            records = []
+            for page in pdf.pages:
+                records.extend(page_row_records(page, strip_timestamps))
+            paragraphs = reflow_records(records, pdf.pages[0].width)
+            full_text = "\n".join(paragraphs)
+        else:
+            if reflow:
+                print("  Note: reflow applies to transcript documents only; "
+                      "writing line-preserving output.")
+            page_texts = []
+            for page in pdf.pages:
+                text = process_page(page, strip_timestamps, force_rows=force_rows)
+                if text.strip():
+                    page_texts.append(text)
+            full_text = "\n\n".join(page_texts)
+
     output_path.write_text(full_text, encoding="utf-8")
     print(f"  Written: {output_path}")
 
@@ -557,6 +685,13 @@ def main():
         "--strip-timestamps",
         action="store_true",
         help="Remove timestamp columns (MM:SS format) from output",
+    )
+    parser.add_argument(
+        "--no-reflow",
+        action="store_true",
+        help="Preserve every PDF line break instead of merging soft-wrapped "
+             "lines into flowing paragraphs (reflow is on by default for "
+             "transcript documents)",
     )
     parser.add_argument(
         "-r", "--recursive",
@@ -596,7 +731,8 @@ def main():
         output_path = dest_dir / (pdf_path.stem + ".txt")
         print(f"  Processing: {pdf_path.name}")
         try:
-            convert_pdf(pdf_path, output_path, args.strip_timestamps)
+            convert_pdf(pdf_path, output_path, args.strip_timestamps,
+                        reflow=not args.no_reflow)
         except Exception as e:
             print(f"  ERROR processing {pdf_path.name}: {e}", file=sys.stderr)
 
