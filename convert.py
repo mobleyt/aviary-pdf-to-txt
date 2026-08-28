@@ -46,18 +46,27 @@ TABLE_HEADER_PATTERN = re.compile(r"^timestamp\s+speaker\s+content$", re.IGNOREC
 
 # Start of a speaker turn: an optional leading timestamp, then a speaker label
 # (one to four capitalized name/initial tokens) ending in a colon, e.g.
-# "00:14 Eugene Hunt:", "GA:", "Interviewee:". Used by --reflow to decide where a
-# paragraph must break. Matched against a reconstructed line (label + content),
-# so the colon may be followed by the spoken text rather than the end of string.
+# "00:14 Eugene Hunt:", "1:16:20 J. Michael Graves:", "GA:", "Interviewee:". Used
+# by --reflow to decide where a paragraph must break. The timestamp may be
+# MM:SS or H:MM:SS. Matched against a reconstructed line (label + content), so the
+# colon may be followed by the spoken text rather than the end of string.
 TURN_START_PATTERN = re.compile(
-    r"^(?:\d{1,2}:\d{2}\s+)?"
+    r"^(?:\d{1,2}:\d{2}(?::\d{2})?\s+)?"
     r"[A-Z][A-Za-z.'\-]*(?:\s+[A-Za-z][A-Za-z.'\-]*){0,3}:(?:\s|$)"
 )
 
 # An accession / collection ID used as a running header, e.g. "LGBTQ-OH-029",
 # "AMN-123". Two or more uppercase letters followed by hyphen-joined groups of
-# letters and/or digits.
-ACCESSION_ID_PATTERN = re.compile(r"^[A-Z]{2,}(?:-[A-Za-z0-9]+)+$")
+# letters and/or digits, optionally trailed by a running page number so a header
+# row that reads as a single line ("LGBTQ-OH-080 2") is still recognized.
+ACCESSION_ID_PATTERN = re.compile(r"^[A-Z]{2,}(?:-[A-Za-z0-9]+)+(?:\s+\d+)?$")
+
+# End-of-recording markers that close a transcript, e.g. "End Recording.",
+# "End of Recording", "[End of Recording]". These are session boilerplate, not
+# spoken words, so they are dropped rather than merged into a speaker's turn.
+RECORDING_MARKER_PATTERN = re.compile(
+    r"^\[?\s*end\s+(?:of\s+)?recording\.?\s*\]?$", re.IGNORECASE
+)
 
 # A short running-header name line: one to four title-cased tokens, e.g.
 # "DeLesslin George-Warren", "Ruby Cornwell". Each token starts with a capital
@@ -83,7 +92,10 @@ def is_boilerplate_content(words):
     if not words:
         return False
 
-    text = " ".join(w["text"] for w in words).strip()
+    # Read the line left-to-right: callers may pass words in ``top`` order, which
+    # would scramble a header whose parts sit at the same height but different x
+    # (e.g. an accession ID on the left and a page number on the right).
+    text = " ".join(w["text"] for w in sorted(words, key=lambda w: w["x0"])).strip()
 
     # Page-number patterns (standalone number, "Page X", "Page X of Y")
     if re.match(r"^\d+$", text):
@@ -544,11 +556,16 @@ def page_row_records(page, strip_timestamps=False):
 
     records = []
     for row in group_into_rows(words):
+        text = " ".join(w["text"] for w in row)
+        # Drop end-of-recording markers so they aren't merged into the final
+        # speaker turn during reflow.
+        if RECORDING_MARKER_PATTERN.match(text.strip()):
+            continue
         records.append({
             "page": page.page_number,
             "top": min(w["top"] for w in row),
             "right": max(w["x1"] for w in row),
-            "text": " ".join(w["text"] for w in row),
+            "text": text,
         })
     return records
 
@@ -560,9 +577,10 @@ def reflow_records(records, page_width):
     A new speaker turn (:data:`TURN_START_PATTERN`) always starts a fresh
     paragraph. Beyond that the rule depends on what kind of block is in progress:
 
-    - Inside a speaker turn, rows keep joining until the next turn or a
-      section-sized vertical gap. A turn runs to the next label regardless of how
-      short its final line is, so a long word wrapping early never splits it.
+    - Inside a speaker turn, rows keep joining until the next turn label,
+      regardless of line length or vertical gaps. Paragraph breaks within a
+      turn are merged too, so a speaker's words are condensed fully into one
+      paragraph rather than split at every indented paragraph.
     - Outside a turn (front matter, abstract, back-matter lists), a row that
       ended short of the text-block right margin closes the block: a wrapped body
       line runs to the margin, so a short line marks a paragraph or list-item
@@ -606,8 +624,11 @@ def reflow_records(records, page_width):
         if current is None or is_turn:
             start_new = True
         elif current_is_turn:
-            # Inside a speaker turn: only a section-sized gap ends it early.
-            start_new = same_page_section_break(rec, prev)
+            # Inside a speaker turn: keep merging every wrapped line and every
+            # paragraph until the next speaker label, so a speaker's words are
+            # condensed fully. Vertical paragraph gaps within a turn are not
+            # section breaks — only a new turn ends it.
+            start_new = False
         else:
             # Front matter / abstract / lists: a short prior line ends the block.
             start_new = (prev["right"] < margin - tol
@@ -618,8 +639,12 @@ def reflow_records(records, page_width):
                 paragraphs.append(current)
             current = text
             current_is_turn = is_turn
-        elif current.endswith("-"):
-            # Word hyphenated across a line break: keep the hyphen, no space.
+        elif (current.endswith("-") and not current.endswith("--")
+              and current[-2:-1].isalpha() and text[:1].isalpha()):
+            # A single hyphen between two letters at a line break is a word split
+            # across lines (e.g. "under-" / "standing"): rejoin with no space. An
+            # em-dash ("--") or a dash flanked by spaces is punctuation, not a
+            # word split, so it falls through to a normal space-join.
             current += text
         else:
             current += " " + text
