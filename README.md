@@ -37,6 +37,11 @@ python convert.py /path/to/pdfs --output-dir /path/to/output
 python convert.py document.pdf --output-dir /path/to/output
 ```
 
+**Keep the opening metadata block and Abstract:**
+```bash
+python convert.py document.pdf --keep-front-matter
+```
+
 ## Output
 
 Each PDF produces a `.txt` file with the same base name (e.g. `alston-legacy.pdf` → `alston-legacy.txt`). By default the `.txt` file is written alongside the PDF. Use `--output-dir` to collect all output in one place.
@@ -47,3 +52,4 @@ Each PDF produces a `.txt` file with the same base name (e.g. `alston-legacy.pdf
 - **Tables** are extracted and rendered as `cell | cell` rows before the surrounding text.
 - **Multi-column text** is detected by finding horizontal gaps between words. Columns are read left-to-right, each top-to-bottom, so the output reads naturally even when the source PDF uses a two-column layout.
 - **Single-column pages** are passed through as-is.
+- **Front matter** — the opening metadata block (title, `Interviewee:`, `Date of Interview:`, accession ID, etc.) and any Abstract — is removed by default, so output begins at the first spoken turn. The block is only dropped when a transcript-start marker (`Begin Interview`, `Begin Recording`, `Transcript Tape 1, Side A`, …) follows a genuine metadata block, so transcripts that open directly on dialogue are left untouched. Pass `--keep-front-matter` to retain it.

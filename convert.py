@@ -77,6 +77,40 @@ NAME_HEADER_PATTERN = re.compile(
     r"^[A-Z][A-Za-z.'\-]*(?:\s+[A-Z][A-Za-z.'\-]*){0,3}$"
 )
 
+# Marks the boundary between the opening metadata block and the transcript body.
+# Transcripts open the interview with one of these cues, sometimes preceded by a
+# rule of underscores:
+#   - "Begin Interview" / "Begin Recording" / "Begin Transcript" (alston,
+#     DeLesslin George-Warren)
+#   - "Transcript Tape 1, Side A" (cornwell, graves), which follows the Abstract
+# Everything up to and including this marker is front matter and is dropped by
+# :func:`strip_front_matter`. The phrases are specific enough that they do not
+# recur in the spoken dialogue.
+FRONT_MATTER_END_PATTERN = re.compile(
+    r"(?:_{3,}\s*)?"
+    r"(?:"
+    r"begin(?:ning)?\s+(?:the\s+)?(?:interview|recording|transcript)"
+    r"|start\s+of\s+(?:the\s+)?(?:interview|recording)"
+    r"|transcript\s+tape\s+\d+\s*,?\s*side\s+\w+"
+    r")",
+    re.IGNORECASE,
+)
+
+# A metadata field-label line, e.g. "Interviewee: ...", "Date of Interview: ...".
+# Used to confirm that the text preceding a boundary marker really is a front-
+# matter block (two or more such labels) before anything is dropped, so a stray
+# marker-like phrase can never truncate an interview that has no front matter.
+FIELD_LABEL_PATTERN = re.compile(
+    r"(?im)^\s*(?:"
+    r"interviewee|interviewer\(s\)|interviewer|narrator|"
+    r"place of interview|date of interview|interview date|date of \w+|"
+    r"location|interview length|length|pronouns|"
+    r"original format|digital format|archival copy|listening copy|"
+    r"transcriber|transcription|editor|proofreader|dates? of \w+|"
+    r"oral history project|project|collection|accession"
+    r")\b[^:\n]{0,40}:"
+)
+
 
 def is_boilerplate_content(words):
     """
@@ -655,7 +689,38 @@ def reflow_records(records, page_width):
     return paragraphs
 
 
-def convert_pdf(pdf_path, output_path, strip_timestamps=False, reflow=True):
+def strip_front_matter(text):
+    """
+    Remove the opening metadata block (and Abstract, if present) from a
+    transcript, returning only the interview body.
+
+    The block runs from the top of the document to a boundary marker such as
+    "Begin Interview", "Begin Recording", or "Transcript Tape 1, Side A"
+    (see :data:`FRONT_MATTER_END_PATTERN`). Everything up to and including that
+    marker is dropped.
+
+    Stripping happens only when the text before the marker holds at least two
+    metadata field labels ("Interviewee:", "Date of Interview:", ...). That guard
+    means a transcript with no front matter — one that opens directly on a
+    speaker turn — is returned untouched even if a marker-like phrase appears in
+    the dialogue.
+    """
+    if not text:
+        return text
+
+    match = FRONT_MATTER_END_PATTERN.search(text)
+    if not match:
+        return text
+
+    preamble = text[:match.start()]
+    if len(FIELD_LABEL_PATTERN.findall(preamble)) < 2:
+        return text
+
+    return text[match.end():].lstrip()
+
+
+def convert_pdf(pdf_path, output_path, strip_timestamps=False, reflow=True,
+                remove_front_matter=True):
     """
     Convert a single PDF file to a text file.
     Text flows continuously without page break markers.
@@ -663,6 +728,10 @@ def convert_pdf(pdf_path, output_path, strip_timestamps=False, reflow=True):
     With ``reflow`` (the default), transcript documents have their soft-wrapped
     lines merged into flowing paragraphs (one per speaker turn). Pass
     ``reflow=False`` to preserve every PDF line break instead.
+
+    With ``remove_front_matter`` (the default), the opening metadata block and
+    Abstract are dropped so the output begins at the first spoken turn. Pass
+    ``remove_front_matter=False`` to keep them.
     """
     pdf_path = Path(pdf_path)
     output_path = Path(output_path)
@@ -686,6 +755,9 @@ def convert_pdf(pdf_path, output_path, strip_timestamps=False, reflow=True):
                 if text.strip():
                     page_texts.append(text)
             full_text = "\n\n".join(page_texts)
+
+    if remove_front_matter:
+        full_text = strip_front_matter(full_text)
 
     output_path.write_text(full_text, encoding="utf-8")
     print(f"  Written: {output_path}")
@@ -717,6 +789,12 @@ def main():
         help="Preserve every PDF line break instead of merging soft-wrapped "
              "lines into flowing paragraphs (reflow is on by default for "
              "transcript documents)",
+    )
+    parser.add_argument(
+        "--keep-front-matter",
+        action="store_true",
+        help="Keep the opening metadata block and Abstract (removed by default, "
+             "so output begins at the first spoken turn)",
     )
     parser.add_argument(
         "-r", "--recursive",
@@ -757,7 +835,8 @@ def main():
         print(f"  Processing: {pdf_path.name}")
         try:
             convert_pdf(pdf_path, output_path, args.strip_timestamps,
-                        reflow=not args.no_reflow)
+                        reflow=not args.no_reflow,
+                        remove_front_matter=not args.keep_front_matter)
         except Exception as e:
             print(f"  ERROR processing {pdf_path.name}: {e}", file=sys.stderr)
 
